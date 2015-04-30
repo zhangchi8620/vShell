@@ -1,0 +1,1290 @@
+#include "filesystem.h"
+#include "../Types/types.h"
+#include "../Blocks/block.h"
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#define   TRUE   1
+#define   FALSE   0 
+bool OpenNewFile, OpenNewFile_s;
+long long FD;
+int FLAGS;
+int FileAddr;
+int f_size;
+int d_size;
+bool toFile;
+extern bool blockmap[MAX_BLOCK];
+FILE *out;
+CACHE *cache;
+
+int getFullPath(DIRECTORY *dir, char *rt)
+{
+	DIRECTORY *p = dir;
+	char t[1000];
+	memset(t, 0, sizeof(t));
+	int k = 0;
+	t[k++] = '>';
+	while (p->parent != p)
+	{
+		for (int i = strlen(p->dirName)-1; i >= 0; i--)
+			t[k++] = p->dirName[i];
+		p = p->parent;
+		t[k++] = 47;
+	}
+	for (int i = strlen(p->dirName)-1; i >= 0; i--)
+		t[k++] = p->dirName[i];
+	t[k++] = 47;
+	t[k++] = '<';
+	t[k] = '\0';
+	for (int i = 0; i < strlen(t); i++)
+		rt[i] = t[--k];
+	return 0;
+}
+
+int dir2str(DIRECTORY *dir, char *str)
+{
+	memset(str, 0, sizeof(str));
+	char u[10];
+	u[0] = (char)(dir->inode+'0');
+	strncpy(str, u, 1);
+	int2str(dir->nchild, u);
+	u[9] = '\0';
+	strncpy(str+1, u, 9);
+	strncpy(str+10, dir->dirName, 255);
+	for (int i = strlen(dir->dirName); i < 255; i++) str[i+10] = '~';
+	strncpy(str+265, dir->modify_date, 24);
+	strncpy(str+289, dir->control, 9);
+	int2str(dir->nlink, u);
+	strncpy(str+298, u, 9);
+	if (dir->nchild == 65535) 
+	{
+		str[307] = '\0';
+		return 0;
+	}
+	for (int i = 0; i < dir->nchild; ++i)
+	{
+		int x = dir->childAddr[i];
+		char t[10];
+		int2str(x, t);
+		strncpy(str+307+i*9, t, 9);
+	}
+	str[307+dir->nchild*9] = '\0';
+	return 0;
+}
+
+int str2dir(char *str, DIRECTORY *dir)
+{
+	char t[256];
+	char u[10];
+	memset(t, 0, sizeof(t));
+	dir->inode = str[0] - '0';
+	strncpy(u, str+1, 9);
+	str2int(u, &dir->nchild);
+	strncpy(dir->dirName, str+10, 255);
+	for (int i = 0; i < 256; i++)
+		if (dir->dirName[i] == '~') dir->dirName[i] = '\0';
+	dir->dirName[255] = '\0';
+	strncpy(dir->modify_date, str+265, 24);
+	dir->modify_date[24] = '\0';
+	strncpy(dir->control, str+289, 9);
+	dir->control[9] = '\0';
+	strncpy(u, str+298, 9);
+	str2int(u, &dir->nlink);
+	memset(dir->childAddr, 0, sizeof(dir->childAddr));
+	if (dir->nchild == 65535) return 0;
+	for (int i = 0; i < dir->nchild; i++)
+	{
+		dir->childAddr[i] = 0;
+		strncpy(u, str+307+i*9, 9);
+		str2int(u, &dir->childAddr[i]);
+	}
+	return 0;
+}
+
+int getTime(char *str)
+{
+	time_t rawtime;
+  	struct tm * timeinfo;
+  	time ( &rawtime );
+  	timeinfo = localtime ( &rawtime );
+  	strncpy(str, asctime (timeinfo), 24);
+	return 0;
+}
+
+int initCache()
+{
+	cache = (CACHE *)malloc(sizeof(CACHE));
+	for (int i = 0; i < 4; i ++)
+	{
+		cache->fd[i] = 0;
+		memset(cache->frame[i], 0, sizeof(cache->frame[i]));
+		cache->used[i] = false;
+		cache->count[i] = 0;
+	}
+	return 0;
+}
+
+int refreshCache()
+{
+	for (int i = 0; i < 4; i++)
+	{
+		if (cache->used[i] == true) fs_write(cache->fd[i], cache->frame[i], strlen(cache->frame[i]));
+	}
+	return 0;
+}
+
+int replaceCache(long long fd, char *frame)
+{
+	int k = 0, cnt = 10000;
+    	for (int i = 0; i < 4; i++)
+	{
+		if (cache->count[i] < cnt)
+		{
+			cnt = cache->count[i];
+			k = i;
+		}
+	}
+	if (cache->used[k] == true)
+	{
+		fs_write(cache->fd[k], cache->frame[k], strlen(cache->frame[k]));
+		strncpy(cache->frame[k], frame, strlen(frame));
+		cache->fd[k] = fd;
+		cache->count[k] = 1;
+	}
+    	else
+	{
+		strncpy(cache->frame[k], frame, strlen(frame));
+		cache->fd[k] = fd;
+		cache->count[k] = 1;
+	}
+	return 0;
+}
+
+int checkCache(long long fd)
+{
+	for (int i = 0; i < 4; i++)
+	{
+		if (cache->fd[i] == fd && cache->used[i] == true)
+		{
+			cache->count[i]++;
+			return i;
+		}
+	}
+	return -1;
+}
+
+int clearCache(int k)
+{
+	cache->fd[k] = 0;
+	cache->used[k] = false;
+	cache->count[k] = 0;
+	memset(cache->frame[k], 0, sizeof(cache->frame[k]));
+	return 0;
+}
+
+
+int initDirectoryTree()
+{
+	char content[12000];
+	DIRECTORY *dir = (DIRECTORY *)malloc(sizeof(DIRECTORY));//&uu;
+	dir->inode = 0;
+	dir->nchild = 65535; 
+	dir->vhddAddr = 1;
+	dir->dir_size = 0;
+	dir->nlink = 1;
+	for (int i = 0; i < 1024; i++)
+		dir->child[i] = NULL;
+	dir->inode_ptr = NULL;
+	dir->parent = dir;
+	strncpy(dir->control, "rwxrwxrwx", 9);
+	dir->control[9] = '\0';
+	memset(dir->dirName, '~', sizeof(dir->dirName));
+	strncpy(dir->dirName, "root", 4);
+	dir->dirName[255] = '\0';
+	char tmp[25];
+	memset(tmp, 0, sizeof(tmp));
+	getTime(tmp);
+	strncpy(dir->modify_date, tmp, 24);
+	dir->modify_date[24] = '\0';
+	memset(content, 0, sizeof(content));
+	dir2str(dir, content);
+	int n = strlen(content);
+	int addr = findFreeBlock(1);
+	int nextaddr = findFreeBlock(addr+1);
+	int k = 0;
+	while (n > 512)
+	{
+		char t[513];
+		memset(t, 0, sizeof(t));
+		strncpy(t, content+(k++)*512, 512);
+		writeBlock(addr, t, nextaddr);
+		n -= 512;
+		addr = nextaddr; //findFreeBlock(nextaddr+1);
+		nextaddr = findFreeBlock(addr+1);
+	}
+	if (n != 0)
+		writeBlock(addr, content+k*512,addr);
+	return 0;
+}
+
+int updateDirectory (DIRECTORY *dir) // if dir need to extend blocks, then apply a new one, or just modify in the original blocks.
+{
+	char content[12000];
+	memset(content, 0, sizeof(content));
+	int addr = dir->vhddAddr;
+	int nextaddr = nextBlock(addr);
+	dir2str(dir, content);
+	int n = strlen(content);
+	int nblk = n/512 + ((n%512 == 0)?0:1);
+	if (addr == nextaddr && nblk == 1)
+	{
+		eraseBlock(addr);
+		writeBlock(addr, content, addr);
+	}
+	else if (addr == nextaddr && nblk > 1)
+	{
+		int k = 0;
+		char t[513];
+		nextaddr = findFreeBlock(addr+1);
+		while (nblk > 1)		
+		{
+			memset(t, 0, sizeof(t));
+			strncpy(t, content+(k++)*512, 512);
+			eraseBlock(addr);
+			writeBlock(addr, t, nextaddr);
+			addr = nextaddr;
+			nextaddr = findFreeBlock(addr+1);
+		}
+		memset(t, 0, sizeof(t));
+		strncpy(t, content+k*512, 512);
+		eraseBlock(addr);
+		writeBlock(addr, t, addr);
+	}
+	else if (addr != nextaddr && nblk == 1)
+	{
+		int st = nextBlock(addr);
+		int end = nextBlock(end);
+		int addr = st;
+		while (st != end)
+		{
+			eraseBlock(st);
+			st = end;
+			end = nextBlock(st);
+		}
+		eraseBlock(st);
+		writeBlock(addr, content, addr);
+	}
+	else if (addr != nextaddr && nblk > 0)
+	{
+		int k = 0;
+		char t[513];
+		nextaddr = findFreeBlock(addr+1);
+		while (nblk > 1)
+		{
+			memset(t, 0, sizeof(t));
+			strncpy(t, content+(k++)*512, 512);
+			eraseBlock(addr);
+			writeBlock(addr, t, nextaddr);
+			addr = nextaddr;
+			nextaddr = findFreeBlock(addr+1);
+		}
+		memset(t, 0, sizeof(t));
+		strncpy(t, content+k*512, 512);
+		eraseBlock(addr);
+		writeBlock(addr, t, addr);
+	}
+	else
+		return -1;
+	return 0;
+}
+
+int updateDirectoryTree (DIRECTORY *dir)
+{
+	updateDirectory(dir);
+	if (dir->nchild == 65535) return 0;
+	if (dir->nchild == 1 && dir->inode == 1) return 0;
+	for (int i = 0; i < dir->nchild; ++i)
+		updateDirectoryTree(dir->child[i]);
+	return 0;
+}
+
+DIRECTORY *getDirectory (char *path)
+{
+	bool ok = false;
+	if (strlen(path) == 0)
+	{
+		return dir_pwd;
+	}
+	DIRECTORY *p = NULL;
+	if (path[0] == 47)
+		p = dir_root;
+	else
+		p = dir_pwd;
+	int nn = strlen(path);
+	char tx[256];
+	memset(tx, 0, sizeof(tx));
+	for (int i = 0, k = 0; i < nn; i++) // "/root/"
+	{
+		if(path[i] == 47)
+		{
+			k = 0;
+			if (strlen(tx) == 0 || strcmp(tx, ".") == 0)
+			{
+				memset(tx, 0, sizeof(tx));
+				continue;
+			}
+			else if (strcmp(tx, "..") == 0)
+			{
+				p = p->parent;
+				memset(tx, 0, sizeof(tx));
+				continue;
+			}
+			else
+			{
+				if (p->nchild == 65535) continue;
+				if (p->nchild == 1 && p->inode == 1) continue;
+				for (int j = 0; j < p->nchild; j++)
+				{
+					if (strcmp(tx, p->child[j]->dirName) == 0)
+					{
+						memset(tx, 0, sizeof(tx));
+						p = p->child[j];
+						break;
+					}
+				}
+				continue;
+			}	
+		}
+		tx[k++] = path[i];
+	}
+	if (strlen(tx) == 0 || strcmp(tx, ".") == 0)
+	{
+		ok = true;
+		memset(tx, 0, sizeof(tx));
+	}
+	else if (strcmp(tx, "..") == 0)
+	{
+		p = p->parent;
+		ok = true;
+		memset(tx, 0, sizeof(tx));
+	}
+	else
+	{
+		if (p->nchild >= 1 && p->nchild <= 1024)
+		{
+			for (int j = 0; j < p->nchild; j++)
+			{
+				if (strcmp(tx, p->child[j]->dirName) == 0)
+				{
+					memset(tx, 0, sizeof(tx));
+					p = p->child[j];
+					ok = true;
+					break;
+				}
+			}
+		}
+	}
+	if (ok)	return p;
+	else return dir_pwd;
+}
+
+int buildRoot()
+{
+	DIRECTORY *root = (DIRECTORY *)malloc(sizeof(DIRECTORY));
+	char content[12000];
+	memset(content, 0, sizeof(content));
+	int addr = 1;
+	blockmap[addr] = true;
+	int nextaddr = nextBlock(addr);
+	int k = 0;
+	while (addr != nextaddr)
+	{
+		readBlock(addr, content+(k++)*512);
+		addr = nextaddr;
+		blockmap[addr] = true;
+		nextaddr = nextBlock(nextaddr);
+	}
+	blockmap[addr] = true;
+	readBlock(addr, content+(k++)*512);
+	str2dir(content, root);
+	root->vhddAddr = 1;
+	root->parent = root;
+	dir_root = root;
+	dir_pwd = root;
+	return 0;
+}
+
+int buildDirectoryTree(DIRECTORY *parent)
+{
+	if (parent->nchild == 65535) return 0;
+	if (parent->nchild == 1 && parent->inode == 1) 
+	{
+		int a = parent->childAddr[0];
+		int b = nextBlock(a);
+		while (a != b)
+		{
+			blockmap[a] = true;
+			a = b;
+			b = nextBlock(a);
+		}
+		blockmap[a] = true;		
+		return 0;
+	}
+	for (int i = 0; i < parent->nchild; i++)
+	{
+		if (parent->childAddr[i] == 0) continue;
+		DIRECTORY *r = (DIRECTORY *)malloc(sizeof(DIRECTORY));
+		char content[12000];
+		memset(content, 0, sizeof(content));
+		int addr = parent->childAddr[i];
+		int nextaddr = nextBlock(addr);
+		int k = 0;
+		blockmap[addr] = true;
+		while (addr != nextaddr)
+		{
+			readBlock(addr, content+(k++)*512);
+			addr = nextaddr;
+			blockmap[addr] = true;
+			nextaddr = nextBlock(nextaddr);
+		}
+		blockmap[addr] = true;
+		readBlock(addr, content+(k++)*512);
+		str2dir(content, r);
+		r->vhddAddr = parent->childAddr[i];
+		r->parent = parent;
+		parent->child[i] = r;
+		buildDirectoryTree(r);
+	}
+	return 0;
+}
+
+int fs_mkfs (void)
+{
+	initBlock(100);
+	initDirectoryTree();
+	buildRoot();
+	buildDirectoryTree(dir_root);
+	return 0;
+}
+
+int trimDirname(char *dirname, char *name)
+{
+	int n = strlen(dirname);
+	int k = 0, cnt = 0;
+	for (int i = n-1; i >= 0; --i, cnt++)
+	{
+		if (dirname[i] == 47)
+		{
+			k = i+1;
+			break;
+		}
+	}
+	for (int i = 0; i < cnt; i++)
+		name[i] = dirname[i+k];
+	return 0;
+}
+
+int fs_mkdir (char *dirname)
+{
+	DIRECTORY *p = NULL;
+	int tt = strlen(dirname);
+	while (tt)
+	{
+		if (dirname[tt-1] == 47)
+			break;
+		--tt;
+	}
+	if (tt)
+	{
+		char mm[1000];
+		memset(mm, 0, sizeof(mm));
+		strncpy(mm, dirname, tt);
+		p = getDirectory(mm);
+	}
+	else
+		p = dir_pwd;
+	DIRECTORY *u = (DIRECTORY *)malloc(sizeof(DIRECTORY));
+	u->inode = 0;
+	u->nchild = 65535;
+	u->nlink = 1;
+	u->vhddAddr = findFreeBlock(p->vhddAddr+1);
+	u->parent = p;
+	for (int i = 0; i < 1024; i++) u->child[i] = NULL;
+	memset(u->childAddr, 0, sizeof(u->childAddr));
+	u->inode_ptr = NULL;
+	char t[256];
+	memset(t, 0, sizeof(t));
+	trimDirname(dirname, t);
+	strncpy(u->dirName, t, strlen(t));
+	memset(t, 0, sizeof(t));
+	getTime(t);
+	strncpy(u->modify_date, t, 24);
+	strncpy(u->control, "rwxrwxrwx", 9);
+	u->dir_size = 0;
+	if (p->nchild == 65535)
+		p->nchild = 1;
+	else
+		p->nchild++;
+	p->child[p->nchild-1] = u;
+	p->childAddr[p->nchild-1] = u->vhddAddr;
+	strncpy(p->modify_date, t, 24);
+	if (OpenNewFile == 1 )			//fs_open
+	{
+		u->inode = 1;	
+		u->nchild = 1;
+		u->childAddr[0] = findFreeBlock(u->vhddAddr+1);	
+		writeBlock(u->childAddr[0],"",u->childAddr[0]);		
+	
+	}	
+	updateDirectory(u);
+	updateDirectory(p);
+	return 0;
+}
+
+int eraseDirectory(DIRECTORY *dir)
+{
+	int addr = dir->vhddAddr;
+	int nextaddr = nextBlock(addr);
+	if (dir->nchild == 65535)
+	{
+		if (addr == nextaddr)
+			eraseBlock(addr);
+		else
+		{
+			while (addr != nextaddr)
+			{
+				eraseBlock(addr);
+				addr = nextaddr;
+				nextaddr = nextBlock(addr);
+			}
+			eraseBlock(addr);
+		}
+		free(dir);
+		return 0;
+	}
+	if (dir->inode == 1)
+	{
+		// It is a vitural directory for the file. 
+		if (addr == nextaddr)
+			eraseBlock(addr);
+		else
+		{
+			while (addr != nextaddr)
+			{
+				eraseBlock(addr);
+				addr = nextaddr;
+				nextaddr = nextBlock(addr);
+			}
+			eraseBlock(addr);
+		}
+		
+		addr = dir->childAddr[0];
+		nextaddr = nextBlock(addr);
+		if (addr == nextaddr)
+			eraseBlock(addr);
+	    	else
+		{
+			while (addr != nextaddr)
+			{
+				eraseBlock(addr); 
+				addr = nextaddr;
+				nextaddr = nextBlock(addr); 
+			}
+			eraseBlock(addr);
+		}
+		free(dir);
+		return 0;
+	}
+	// common situation.
+	for (int i = 0; i < dir->nchild; i++)
+		eraseDirectory(dir->child[i]);
+	if (addr == nextaddr)
+		eraseBlock(addr);
+	else
+	{
+		while (addr != nextaddr)
+		{
+			eraseBlock(addr);
+			addr = nextaddr;
+			nextaddr = nextBlock(addr);
+		}
+		eraseBlock(addr);
+	}
+	free(dir);
+	return 0;
+}
+
+int fs_rmdir (char *dirname)
+{
+	DIRECTORY *p = getDirectory(dirname);
+	if (p == dir_root || p == dir_pwd) return -1;
+	DIRECTORY *u = p->parent;
+	int k = 0;
+	for (k = 0; k < u->nchild; k++)
+		if (u->childAddr[k] == p->vhddAddr) break;
+	if (k == u->nchild) return -1;
+	for (int i = k; i < u->nchild-1; i++)
+	{
+		u->child[i] = u->child[i+1];
+		u->childAddr[i] = u->childAddr[i+1];
+	}
+	u->child[u->nchild-1] = NULL;
+	u->childAddr[u->nchild-1] = 0;
+	u->nchild--;
+	if (u->nchild == 0) u->nchild = 65535;
+	updateDirectory(u);
+	
+	eraseDirectory(p);
+	return 0;
+}
+
+
+int fs_size(int addr)
+{
+	int l = 0;	
+	char buf[10000];
+	memset(buf, 0, sizeof(buf));	
+	readBlock(addr, buf);
+	for (int i = 0; i < strlen(buf); i++)
+		if (buf[i] == '~' || buf[i] == '\0') buf[i] = '\0';
+	l = l + strlen(buf);
+
+		while (addr != nextBlock(addr))
+		{
+			readBlock(addr, buf);
+			l = l + strlen(buf);
+			addr = nextBlock(addr);
+		}
+
+	return l;
+}
+
+int fs_nBlocks(int addr)
+{
+	int nBlocks= 1;	
+	while (addr != nextBlock(addr))
+		{
+			addr = nextBlock(addr);
+			nBlocks ++;
+		}
+
+	return nBlocks;
+
+}
+
+int dir_size(char *filename)
+{
+	char path[100], file[1000];
+	memset(path, 0, strlen(path));
+	DIRECTORY *p = getDirectory(filename);
+	if (p->nchild == 65535)
+		return 0;
+	for (int i=0; i < p->nchild; i++)
+	{
+		if (p->child[i]->inode == 1)
+		{	
+			p->dir_size = p->dir_size + fs_size(p->child[i]->childAddr[0]);
+		}
+		else 
+		{	
+			strcpy(path+strlen(path), filename);
+			strcpy(path+strlen(path),"/");
+			strcpy(path+strlen(path), p->child[i]->dirName);
+			dir_size(path);			
+			p->dir_size = p->dir_size + p->child[i]->dir_size;
+			memset(path, 0, strlen(path));
+		}
+//		updateDirectory(p);
+//		printf("Dir %s size is :%d\n",p->dirName, p->dir_size);
+	}				
+	return 0;
+}
+
+int dir_nBlocks(char *filename)
+{
+	char path[100], file[1000];
+	memset(path, 0, strlen(path));
+	DIRECTORY *p = getDirectory(filename);
+	if (p->nchild == 65535)
+		return 0;
+	for (int i=0; i < p->nchild; i++)
+	{
+		if (p->child[i]->inode == 1)
+		{	
+			p->nBlocks = p->nBlocks + fs_nBlocks(p->child[i]->childAddr[0]);
+		}
+		else 
+		{	
+			strcpy(path+strlen(path), filename);
+			strcpy(path+strlen(path),"/");
+			strcpy(path+strlen(path), p->child[i]->dirName);
+			dir_nBlocks(path);			
+			p->nBlocks = p->nBlocks + p->child[i]->nBlocks + 1;
+			memset(path, 0, strlen(path));
+		}
+//		updateDirectory(p);
+	}				
+	return 0;
+}
+
+int fs_open (char *filename, int flags)
+{
+	char t[256], temp[2], parent[256],f[strlen(filename)];
+	FLAGS = flags;
+	int i,l,k;
+	bool EXIST;
+	memset(t, 0, sizeof(t));
+	memset(temp, 0, sizeof(temp));
+	memset(parent, 0, sizeof(parent));
+	memset(f, 0, sizeof(f));
+
+	l=strlen(filename);
+	for (i = l, k = 0; i >= 0 && k < 2; i--)
+	{
+		if (filename[i] == 47) {
+			temp[k] = i; 	
+			k++; }
+	}
+	for (i=0; i< strlen(filename)-temp[0]+1; i++)
+		f[i]=filename[i+temp[0]];	
+	f[strlen(filename)-temp[0]] = '\0';
+	if (temp[0] != 0)
+		for (i = 0; i<temp[0]; i++)
+		{
+			parent[i] = filename[i];	
+		}
+	else 
+		strcpy(parent, dir_pwd->dirName);	
+	DIRECTORY *par = getDirectory(parent);
+
+	if (strcmp(par->dirName, parent)!=0)
+	{
+		if (toFile) fprintf(out, "Error: Wrong path for opening file!\n");
+		else printf("Error: Wrong path for opening file!\n");
+		FD = -1;		
+		return -1;
+	}	
+	DIRECTORY *p = getDirectory(filename);
+	if (par->nchild != 65535)	
+		for(i=0; i < par->nchild; i++)
+		{
+			if (strcmp(f, par->child[i]->dirName)==0)
+			{
+			EXIST = TRUE;
+			break;
+			}
+		}
+	else	
+		EXIST = FALSE;
+		
+	
+
+	if (EXIST == FALSE && flags == 2)
+	{
+		OpenNewFile_s = true;
+		OpenNewFile = true;
+		fs_mkdir(filename);
+		DIRECTORY *pp = getDirectory(filename);
+		FD = (pp->childAddr[0]-1)*512;
+		blockmap[pp->childAddr[0]] = 1;
+		pp->dir_size = 0;
+		FileAddr = FD;
+		f_size = pp->dir_size;
+		
+		return 0;
+
+	}	
+	if (EXIST == FALSE && flags !=2)
+	{
+		if (toFile) fprintf(out, "Error: File does not exist!\n");
+		else printf("Error: File does not exist!\n");
+		FD = -1;
+		return -1;
+	}
+	else if (EXIST == TRUE) 
+	{
+ 	
+		int aliveFile = 0;
+		char control[10]={0};
+		if (p == NULL) return -1;
+
+ 		if (p->inode == 0) 
+		{
+			if (toFile) fprintf(out, "Error: Not a valid file.\n");
+			else printf("Error: Not a valid file.\n");
+			FD = -1;
+			return -1;
+		}
+		if (p->inode == 1){
+			DIRECTORY *pp = getDirectory(filename);		
+			pp->dir_size = fs_size(pp->vhddAddr);	   	
+			f_size = pp->dir_size;
+			switch (flags){
+				case FS_O_RDONLY : control = {'r','-','x','r','-','x','r','-','x'}; 
+				break;
+				case FS_O_WRONLY : control = {'-','w','x','-','w','x','-','w','x'};
+				break;
+				case FS_O_RDWR   : control = {'r','w','x','r','w','x','r','w','x'};
+				break;
+	   		}	
+		}
+		if (strcmp(p->control, "rwxrwxrwx") == 0)
+		{
+			if (toFile) fprintf(out, "%s\n", control);
+			else puts(control);
+		}	
+		else if ((strcmp(p->control, "r-xr-xr-x") ==0) && (flags == 1))
+		{
+			if (toFile) fprintf(out, "%s\n", control);
+			else puts(control);
+		}
+		else if ((strcmp(p->control, "-wx-wx-wx") ==0) && (flags == 2))
+		{
+			if (toFile) fprintf(out, "%s\n", control);
+			else puts(control);
+		}
+		else	
+		{
+			if (toFile) fprintf(out, "Ilegal aceess operation, this file is: %s\n", p->control);	
+			else printf("Ilegal aceess operation, this file is: %s\n", p->control);	
+			return -1;
+		}
+		FD = (p->childAddr[0]-1)*512;
+		FileAddr = FD;
+		
+		return 0;
+	}
+
+	
+
+}
+
+int fs_close (long long fd)
+{
+	OpenNewFile = false;
+	OpenNewFile_s = false;
+	if (fd >= 0)
+	{
+		FD = -1;
+		if (toFile) fprintf(out, "File is closed\n");
+		else puts("File is closed");
+		return 0;
+	}
+}
+
+int fs_read (long long fd, char *fbuffer, int count)
+{
+	if (fd< FileAddr || fd > FileAddr+f_size)
+	{
+		if (toFile) fprintf(out, "Error: Reading out of file!\n");
+		else printf("Error: Reading out of file!\n");
+		FD = FileAddr;
+		return -1;
+	}
+	char tempbuf[100000];
+	char buf[100000];
+  
+	memset(tempbuf, 0, sizeof(tempbuf));
+	memset(buf, 0, sizeof(buf));
+	memset(fbuffer, 0, sizeof(fbuffer));
+	
+	if (fd<0)
+		return -1;
+	if (count == 0)
+		return 0;	
+	int i, addr;
+	addr = fd/512+1;
+	int xx = count/512+1;
+	int l=count;
+	for  (int m=0; m < xx; m++)	
+	{
+		readBlock(addr, buf);	
+		for (i=0; i< (l<512?l:512); i++)
+		{	
+			tempbuf[i+m*512] = buf[i+fd%512];  		
+		}
+		l = l -512;
+	if (addr != nextBlock(addr))	
+		addr = nextBlock(addr);
+	else
+		{
+		tempbuf[(m+1)*512+1] = 0;
+		break;
+		}
+	}
+	strncpy(fbuffer, tempbuf, count);
+	for (int i = 0; i < strlen(fbuffer); i++)
+		if (fbuffer[i] == '~' || fbuffer[i] == '\0') fbuffer[i] = '\0';
+	fd = fd + (strlen(tempbuf)>=count?count:strlen(tempbuf));
+	FD = fd;
+	return 0;
+}
+
+int fs_write (long long fd, char *strinput, int count)
+{
+	if (fd< FileAddr || fd > FileAddr + f_size)
+	{
+		if (toFile) fprintf(out, "Error: Writing out of file!\n");
+		else puts("Error: Writing out of file!");
+		FD = FileAddr;
+		return -1;	
+	}
+	if (count == 0)
+	{
+		if (toFile) fprintf(out, "Nothing is written.\n");
+		else puts("Nothing is written.");
+		return 0;
+	}	
+	if (strlen(strinput)>count+1)
+	{
+		if (toFile) fprintf(out, "Error: Writing out of the count number!\n");
+		else puts("Error: Writing out of the count number!");
+		return -1;
+	}
+	if (FLAGS == FS_O_RDONLY)
+	{
+		if (toFile) fprintf(out, "Warning: File is open for read only\n");
+		else puts("Warning: File is open for read only");
+	}
+	count = count - 1;
+	int len = count + fd%512 + 1;	
+	char str[10000],content[513];
+	memset(str, 0, sizeof(str));
+	int addr = fd/512 + 1;	
+	int h = fd%512;
+//	int t = h + count;
+	char fbuffer[513];	
+	memset(fbuffer, 0, sizeof(fbuffer));
+		f_size = f_size + count+1;
+	readBlock(addr, content);
+	if (h ==0)
+	{
+		strncpy(str,strinput,count+1);
+//		puts(strinput);
+//		printf("count is %d\n", count);	
+	}
+	else
+	{
+		strcpy(str, content);
+		strncpy(str+h, strinput, count + 1);
+//		puts(str);
+//		printf("count is %d\n", count + 1);	
+	}	
+	if (fd<0)  return -1;
+	
+	int nextaddr;
+	int l = strlen(str);
+	int m = l/512+1;
+	
+	for (int i = 0; i < m; i++)
+	{
+		memset(fbuffer, 0, sizeof(fbuffer));
+		if (m-i > 1)
+		{		
+			if (nextBlock(addr) == addr)
+				nextaddr = findFreeBlock(addr+1);
+			else 		
+				nextaddr = nextBlock(addr);
+		}
+		else nextaddr = nextBlock(addr);
+		int xx = l >512?512:l;		
+		for (int j=0; j< xx; j++)
+			fbuffer[j] = str[j+i*512];
+		eraseBlock(addr);
+		blockmap[addr] = false;		
+		writeBlock(addr, fbuffer, nextaddr);
+		l = l-512;
+		addr = nextaddr;
+	}
+		
+	fd = fd + count;
+	FD = fd;
+	return 0;
+}
+int fs_seek (long long fd, int offset)
+{
+	FD = fd;
+	int size = 0;
+	int addr = fd/512+1;
+	if (offset + fd%512 > size)	
+	{
+		if (toFile) fprintf(out, "Error: Beyond the EOF!\n");
+		else printf("Error: Beyond the EOF!\n");
+		return -1;
+	}
+	else
+	{
+		fd = fd + offset;
+		FD = fd;
+		if (toFile) fprintf(out, "FD is %d after seek\n", FD);
+		else printf("FD is %d after seek\n", FD);
+		return 0;
+	}
+}
+
+int fs_chdir (char *newdirname)
+{
+	int n = strlen(newdirname);
+	memset(dir_pwd->dirName, 0, sizeof(dir_pwd->dirName));
+	for (int i = 0; i < 255; i++)
+		dir_pwd->dirName[i] = '~';
+	dir_pwd->dirName[254] = '\0';
+	strncpy(dir_pwd->dirName, newdirname, n);
+	dir_pwd->dirName[n] = '\0';
+	updateDirectory(dir_pwd);
+	return 0;
+}
+
+int updatelink (DIRECTORY *p, int vhdd, int sig)
+{
+	if (p->inode == 1 && p->childAddr[0] == vhdd)
+	{
+		p->nlink += sig;
+		updateDirectory(p);
+		return 0;
+	}
+	
+	if (p->nchild == 65535) return 0;
+	for (int i = 0; i < p->nchild; i++)
+	{
+		updatelink (p->child[i], vhdd, sig);
+	}
+	return 0;
+}
+
+int findNlink (DIRECTORY *p, int vhdd)
+{
+	if (p->inode == 1 && p->childAddr[0] == vhdd)
+		return p->nlink;
+	else return 0;
+	if (p->nchild = 65535) return 0;
+	for (int i = 0; i < p->nchild; i++)
+	{
+		findNlink(p->child[i], vhdd);
+	}
+	return 0;
+}
+
+int fs_link (char *oldpath, char *newpath) // oldpath & newpath are path of the file a/b/c.txt a/x/c.txt
+{
+	DIRECTORY *p = getDirectory(newpath);
+	DIRECTORY *old = getDirectory(oldpath);
+	if (p != NULL && old == NULL) return -1;
+	if (old->inode == 0) return -1;
+	DIRECTORY *q = (DIRECTORY *)malloc(sizeof(DIRECTORY));
+	int nn = strlen(newpath);
+	while (nn >= 1)
+	{
+		if (newpath[nn-1] == 47) break;
+		nn--;
+	}
+	memset(q->dirName, 0, sizeof(q->dirName));
+	strncpy(q->dirName, newpath+nn, strlen(newpath)-nn);
+
+	q->nlink = old->nlink;
+	q->inode = old->inode;
+	q->nchild = old->nchild;
+	q->vhddAddr = findFreeBlock(1);
+	q->childAddr[0] = old->childAddr[0];
+
+	char tmp[500];
+	memset(tmp, 0, sizeof(tmp));
+	strncpy(tmp, newpath, nn);
+	p = getDirectory(tmp);
+	if (p->nchild == 65535)
+		p->nchild = 1;
+	else 
+		p->nchild++;
+	p->child[p->nchild-1] = q;
+	p->childAddr[p->nchild-1] = q->vhddAddr;
+	q->parent = p;
+	getTime(tmp);
+	strncpy(q->modify_date, tmp, 24);
+	strncpy(q->control, old->control, 9);
+	q->dir_size = old->dir_size;
+	updateDirectory(p);
+
+	updatelink(dir_root, old->childAddr[0], 1);
+	return 0;
+}
+
+int fs_unlink (char *filename)
+{
+	DIRECTORY *p = getDirectory(filename);
+	long long xfd = (p->vhddAddr-1)*512;
+	if (xfd == FD) return -1;
+	if (p->nlink > 1)
+	{
+		DIRECTORY *q = p->parent;
+		int k = 0;
+		for (int i = 0; i < q->nchild; i++)
+		{
+			if (q->childAddr[i] == p->vhddAddr)
+			{
+				k = i;
+				break;
+			}
+		}
+		q->nchild--;
+		if (q->nchild == 0) q->nchild = 65535;
+		for (int i = k; i < q->nchild; i++)
+		{
+			q->childAddr[i] = q->childAddr[i+1];
+			q->child[i] = q->child[i+1];
+		}
+		updateDirectory(q);
+		int addr = p->vhddAddr;
+		int nextaddr = nextBlock(addr);
+		while (addr != nextaddr)
+		{
+			eraseBlock(addr);
+			addr = nextaddr;
+			nextaddr = nextBlock(addr);
+		}
+		eraseBlock(addr);
+		updatelink(dir_root, p->childAddr[0], -1);
+	}
+	else
+		fs_rmdir(filename);
+	return 0;
+}
+
+int fs_tree(DIRECTORY *p, int cnt)
+{
+	if (p->inode == 1)
+	{
+		if (toFile)
+		{
+			for (int i = 0; i < cnt; i++) fprintf(out, "\t");
+			fprintf(out, "%s\n", p->dirName);
+		}
+		else
+		{
+			for (int i = 0; i < cnt; i++) printf("\t");
+			printf("%s\n", p->dirName);
+		}
+		return 0;
+	}
+	if (p->nchild == 65535)
+	{
+		if (toFile)
+		{
+			for (int i = 0; i < cnt; i++) fprintf(out, "\t");
+			fprintf(out, "%s\n", p->dirName);
+		}
+		else
+		{
+			for (int i = 0; i < cnt; i++) printf("\t");
+			printf("%s\n", p->dirName);
+		}
+		return 0;
+	}
+
+	if (toFile)
+	{
+		for (int i = 0; i < cnt; i++) fprintf(out, "\t");
+		fprintf(out, "%s->\n", p->dirName);
+	}
+	else
+	{
+		for (int i = 0; i < cnt; i++) printf("\t");
+		printf("%s->\n", p->dirName);
+	}
+	for (int i = 0; i < p->nchild; i++)
+		fs_tree(p->child[i], cnt+1);
+	return 0;
+}
+
+int fs_stat(char *filename)
+{
+	bool EXIST;
+	char t[256], temp[2], parent[256],f[strlen(filename)];
+	int i,l,k,size= 0, items;
+	memset(t, 0, sizeof(t));
+	memset(temp, 0, sizeof(temp));
+	memset(parent, 0, sizeof(parent));
+	memset(f, 0, sizeof(f));
+	l=strlen(filename);
+	for (i = l, k = 0; i >= 0 && k < 2; i--)
+	{
+		if (filename[i] == 47) {
+			temp[k] = i; 	
+			k++; }
+	}
+	if (temp[0]==0)
+		{
+			strcpy(f, filename); 
+			strcpy(parent, dir_pwd->dirName);
+		}	
+	else
+		for (i=0; i< strlen(filename)-temp[0]; i++)
+ 			{
+				f[i]=filename[i+temp[0]+1];	
+				f[strlen(filename)-temp[0]] = '\0';
+			}
+	if (toFile)
+		fprintf(out, "You are checking state of : %s\n", f);
+	else
+		printf("You are checking state of : %s\n", f);
+	for (i = 0; i<temp[0]; i++)
+		{
+			parent[i] = filename[i];	
+		}
+	DIRECTORY *par = getDirectory(parent);
+	if (strcmp(par->dirName, parent) != 0 )
+	{
+		if (toFile) fprintf(out, "Error: Wrong path!\n");
+		else puts("Error: Wrong path!");
+	}
+	DIRECTORY *p = getDirectory(filename);
+	EXIST = false;
+	for(i=0; i < par->nchild; i++)
+	{
+		if (strcmp(f, par->child[i]->dirName)==0)
+			EXIST = true;
+	}
+	if (EXIST == false)
+	{	
+		if (toFile) fprintf(out, "Error: File does not exist!\n");
+		else puts("Error: File does not exist!");
+		return -1;
+	}
+	if (EXIST == true)
+	{
+		DIRECTORY *p = getDirectory(filename);
+		p->dir_size = 0;
+		p->nBlocks = 1;
+		
+//		updateDirectory(p);	
+		if (p->inode == 1)		
+		{	p->dir_size = fs_size(p->childAddr[0]);
+			items = 0;
+			p->nBlocks = fs_nBlocks(p->childAddr[0]);
+			p->nlink = findNlink(p, p->childAddr[0]);
+		}
+		else 
+		{		
+			if (p->nchild == 65535)
+				items = 0;	
+			else 
+			{
+				for (int nn=0; nn<p->nchild; nn++)
+				{	
+					p->child[nn]->dir_size = 0;
+				}
+					dir_size(filename);
+					items = p->nchild;
+					dir_nBlocks(filename);
+			}
+			p->nlink = 0;
+		}
+		if (toFile)
+			fprintf(out, "Name:\t%s\nSize:\t%d\nBlocks:\t%d\nLinks:%d\t\n%s\nDate Modified:\t%s\nItems:\t%d\n",p->dirName, p->dir_size, p->nBlocks, p->nlink, (p->inode==1)?"File":"Directory", p->modify_date, items);
+		else
+			printf("Name:\t%s\nSize:\t%d\nBlocks:\t%d\nLinks:%d\t\n%s\nDate Modified:\t%s\nItems:\t%d\n",p->dirName, p->dir_size, p->nBlocks, p->nlink, (p->inode==1)?"File":"Directory", p->modify_date, items);
+	}
+	
+	return 0;
+}
+

@@ -1,0 +1,19 @@
+#include "../Types/types.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+BLOCKTREE *blk_root;
+
+char *blk2char (BLOCK *blk);
+
+BLOCK *char2blk (char *ch);
+
+int initBlock (BLOCK *blk); // initial each block. blk->next = null, blk->content = "\0", write blk to vhdd. return 0: success; return -1: failed.
+
+char *readBlock (BLOCK *blk); // Return the Block's content.
+
+int writeBlock (BLOCK *blk); // Change BLOCK to char *, then write char * to vhdd.
+
+
+

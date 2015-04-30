@@ -1,0 +1,10 @@
+mkfs
+open a.txt w
+write 1024 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+close 1024
+cat a.txt
+tree
+import input input.txt
+ls
+stat input.txt
+

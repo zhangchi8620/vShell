@@ -1,0 +1,161 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "./Types/types.h"
+#include "./Blocks/block.h"
+
+int int2str(int x, char *str)
+{
+	char a[10];
+	memset(a, 0, sizeof(a));
+	memset(str, 0, sizeof(str));
+	for (int i = 0; i < 10; i++)
+		a[i] = str[i] = '~'; // Default value is ~. 
+	int k = 0;
+	while (x)
+	{
+		a[k++] = x%10 + '0';
+		x /= 10;
+	}
+	for (int i = 0; i < k; i++)
+		str[i] = a[k-i-1];
+	str[9] = '\0';
+	return 0;
+}
+
+int bool2str(int x, char *str)
+{
+	if (x == 0)
+		str[0] = '0', str[1] = '\0';
+	else
+		str[0] = '1', str[1] = '\0';
+	return 0;	
+}
+
+int blk2str(BLOCK *blk, char *str)
+{
+	char tmp[10];
+	memset(str, 0, sizeof(str));
+	bool2str(blk->in_use, tmp);
+	strcat (str, tmp);
+	int2str(blk->vhddAddr, tmp);
+	strcat (str, tmp);
+	strcat (str, blk->content);
+	int2str(blk->nextAddr, tmp);
+	strcat (str, tmp);
+	puts(str);
+	return 0;
+}
+
+int initBlock(int BlockNum) // initialize the overal VHDD, including the directory & block tree parts.
+{
+	memset(blockmap, 0, sizeof(blockmap));
+	FILE *fp = fopen("vhdd", "w+");
+	if (fp == NULL) return -1;
+	for (int i = 1; i <= BlockNum; i++)
+	{
+		BLOCK *blk = (BLOCK *)malloc(BLOCK_SIZE);
+		blk->vhddAddr = i;
+		blk->in_use = 0;
+		blk->nextAddr = i;
+		memset(blk->content, '~', sizeof(blk->content));
+		char str[BLOCK_SIZE];
+		memset(str, 0, sizeof(str));
+		blk2str(blk, str);
+		fputs(str, fp);
+		free(blk);
+		//printf("%d\n", i);
+	}
+	fclose(fp);
+	return 0;
+}
+
+int str2int(char *str, int *x)
+{
+	(*x) = 0;
+	for (int i = 0; i < strlen(str); ++i)
+	{
+		if (str[i] == '~') break;
+		(*x) = (*x)*10 + str[i]-'0';
+	}
+	return (*x);
+}
+
+int str2blk(char *str, BLOCK *blk)
+{
+		blk->in_use = str[0] - '0';
+		char tmp[10];
+		memset(tmp, 0, sizeof(tmp));
+		strncpy(tmp, str+1, 9);
+		str2int(tmp, &blk->vhddAddr);
+		strncpy(blk->content, str+10, 511);
+		blk->content[511] = '\0';
+		strncpy(tmp, str+522, 9);
+		str2int(tmp, &blk->nextAddr);
+}
+
+int readBlock(int addr, char *content)
+{
+	if (blockmap[addr] == false) return -1;
+	FILE *f = fopen("vhdd", "r");
+	if (f == NULL) return -1;
+	fseek(f, (addr-1)*BLOCK_SIZE, 0);
+	char str[BLOCK_SIZE];
+	fgets(str, BLOCK_SIZE, f);
+	BLOCK *b = (BLOCK *)malloc(sizeof(BLOCK));
+	str2blk(str, b);
+	if (b->in_use == 0) return -1;
+	strcpy(content, b->content);
+	fclose(f);
+	free(b);
+	return 0;
+}
+	
+int writeBlock (int addr, char *content, int nextaddr)
+{
+	if (blockmap[addr] == true) return -1; 
+	if (strlen(content) >= 512)
+	{
+		return -1;	
+	}
+	FILE *f = fopen("vhdd", "r+");
+	if (f == NULL) return -1;
+	fseek(f, (addr-1)*BLOCK_SIZE, 0);
+	if (fgetc(f) == '1') return -1;
+	char str[BLOCK_SIZE];
+	BLOCK *b = (BLOCK *)malloc(sizeof(BLOCK));
+	b->vhddAddr = addr;
+	b->nextAddr = nextaddr;
+	b->in_use = 1;
+	memset(b->content, '~', sizeof(b->content));
+	strncpy(b->content, content, strlen(content));
+	b->content[511] = '\0';
+	blk2str(b, str);
+	fputs(str, f);
+	blockmap[addr] = true;
+	fclose(f);
+	free(b);
+}
+
+int eraseBlock (int addr)
+{
+	if (blockmap[addr] == false) return -1;
+	FILE *f = fopen("vhdd", "r+");
+	if (f == NULL) return -1;
+	fseek(f, (addr-1)*BLOCK_SIZE, 0);
+	fputc('0', f);
+	blockmap[addr] = false;
+	fclose(f);
+	return 0;
+}	
+
+int isEmpty(int addr)
+{
+	FILE *f = fopen("vhdd", "r");
+	if (f == NULL) return -1;
+	fseek(f, (addr-1)*BLOCK_SIZE, 0);
+	int in_use = fgetc(f) - '0';
+	if ((in_use == 0) && (!blockmap[addr])) return 1;
+	else if ((in_use == 1) && blockmap[addr]) return 0;
+	return -1;
+}
